@@ -1,5 +1,5 @@
 numpy
-faiss-gpu # faiss-gpu if you have CUDA or faiss-cpu for CPU
+hnswlib
 Pillow
 transformers
 torch

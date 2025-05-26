@@ -15,7 +15,7 @@ PROCESSED_DATA_DIR = os.path.join(PROJECT_ROOT, "processed_data")
 os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(PROCESSED_DATA_DIR, "image_metadata.sqlite3")
-FAISS_INDEX_PATH = os.path.join(PROCESSED_DATA_DIR, "image_vectors.index")
+VECTOR_INDEX_PATH = os.path.join(PROCESSED_DATA_DIR, "image_vectors.hnsw")
 
 BATCH_SIZE = 16
 IMAGE_EXTENSIONS = (

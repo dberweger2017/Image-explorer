@@ -3,19 +3,18 @@ import os
 import sqlite3
 import hashlib
 import time
-from datetime import datetime
 import numpy as np
-import faiss
+import hnswlib
 from PIL import Image
 from transformers import AutoProcessor, AutoModel
-import torch # PyTorch is usually a dependency for Hugging Face Transformers
+import torch
 
 from config import (
     MODEL_ID,
     DEVICE,
     IMAGE_SOURCE_DIR,
     DB_PATH,
-    FAISS_INDEX_PATH,
+    VECTOR_INDEX_PATH,
     BATCH_SIZE,
     IMAGE_EXTENSIONS,
     PROCESSED_DATA_DIR,
@@ -27,7 +26,6 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     # Store relative path from IMAGE_SOURCE_DIR
-    # Store faiss_id which is the direct ID used in the FAISS index
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS images (
@@ -36,7 +34,7 @@ def init_db():
             file_hash TEXT NOT NULL,
             last_modified REAL NOT NULL,
             vectorized_at REAL NOT NULL,
-            faiss_id INTEGER UNIQUE
+            vector_index_id INTEGER UNIQUE
         )
     """
     )
@@ -53,13 +51,13 @@ def get_file_hash(filepath):
     return hasher.hexdigest()
 
 def get_image_info_from_db():
-    """Fetches all image info (relative_path, hash, last_modified, faiss_id) from DB."""
+    """Fetches all image info (relative_path, hash, last_modified, vector_index_id) from DB."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT relative_path, file_hash, last_modified, faiss_id FROM images")
+    cursor.execute("SELECT relative_path, file_hash, last_modified, vector_index_id FROM images")
     # Using a dictionary for faster lookups by relative_path
     db_images = {
-        row[0]: {"hash": row[1], "last_modified": row[2], "faiss_id": row[3]}
+        row[0]: {"hash": row[1], "last_modified": row[2], "vector_index_id": row[3]}
         for row in cursor.fetchall()
     }
     conn.close()
@@ -109,61 +107,63 @@ def vectorize_batch(image_paths, processor, model):
         images_pil = [Image.open(p).convert("RGB") for p in image_paths]
         inputs = processor(images=images_pil, return_tensors="pt", padding=True).to(DEVICE)
         image_features = model.get_image_features(**inputs)
-        # Normalize embeddings for cosine similarity (common practice)
         image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
         return image_features.cpu().numpy()
     except Exception as e:
         print(f"Error vectorizing batch (first image: {image_paths[0] if image_paths else 'N/A'}): {e}")
-        # Return None or empty list to indicate failure for this batch
         return [None] * len(image_paths)
 
 
-# --- FAISS Index Management ---
-def load_faiss_index(model_dim):
-    """Loads FAISS index if it exists, otherwise creates a new one."""
-    if os.path.exists(FAISS_INDEX_PATH):
-        print("Loading existing FAISS index...")
-        try:
-            index = faiss.read_index(FAISS_INDEX_PATH)
-            # Sanity check for dimension, though IndexIO doesn't store it directly
-            if index.d != model_dim:
-                print(f"Warning: FAISS index dimension ({index.d}) "
-                      f"differs from model dimension ({model_dim}). Recreating.")
-                index = faiss.IndexIDMap(faiss.IndexFlatL2(model_dim))
-            else:
-                 print(f"FAISS index loaded. Dimension: {index.d}, Total vectors: {index.ntotal}")
+# --- HNSW Index Management ---
+def load_hnsw_index(model_dim, index_path, initial_max_elements=1000, ef_construction=200, M=16):
+    """Loads HNSWlib index if it exists, otherwise creates a new one."""
+    # Using 'ip' for inner product, which is equivalent to cosine similarity for normalized vectors
+    index = hnswlib.Index(space='ip', dim=model_dim)
 
+    if os.path.exists(index_path):
+        print(f"Loading existing HNSW index from {index_path}...")
+        try:
+            index.load_index(index_path)
+            # load_index in Python bindings infers max_elements from the file
+            print(f"HNSW index loaded. Max elements: {index.max_elements_}, "
+                  f"Current count: {index.get_current_count()}, Dimension: {index.dim}")
+            if index.dim != model_dim:
+                 print(f"Warning: HNSW index dimension ({index.dim}) "
+                       f"differs from model dimension ({model_dim}). Recreating.")
+                 if os.path.exists(index_path): os.remove(index_path)
+                 index = hnswlib.Index(space='ip', dim=model_dim) # Re-init
+                 index.init_index(max_elements=initial_max_elements, ef_construction=ef_construction, M=M)
+                 print("New HNSW index initialized after dimension mismatch.")
         except Exception as e:
-            print(f"Error loading FAISS index: {e}. Recreating.")
-            # Use IndexIDMap to allow adding vectors with specific IDs and removing them
-            index = faiss.IndexIDMap(faiss.IndexFlatL2(model_dim))
+            print(f"Error loading HNSW index: {e}. Recreating.")
+            if os.path.exists(index_path): os.remove(index_path)
+            index.init_index(max_elements=initial_max_elements, ef_construction=ef_construction, M=M)
+            print(f"New HNSW index initialized after error. Max elements: {index.max_elements_}")
     else:
-        print("Creating new FAISS index...")
-        index = faiss.IndexIDMap(faiss.IndexFlatL2(model_dim)) # L2 distance
-        # For cosine similarity with normalized vectors, IndexFlatIP (Inner Product) is equivalent to L2
-        # index = faiss.IndexIDMap(faiss.IndexFlatIP(model_dim))
+        print("Creating new HNSW index...")
+        index.init_index(max_elements=initial_max_elements, ef_construction=ef_construction, M=M)
+        print(f"New HNSW index initialized. Max elements: {index.max_elements_}")
     return index
 
-def save_faiss_index(index):
-    """Saves the FAISS index to disk."""
-    print(f"Saving FAISS index to {FAISS_INDEX_PATH} with {index.ntotal} vectors...")
-    faiss.write_index(index, FAISS_INDEX_PATH)
-    print("FAISS index saved.")
+def save_hnsw_index(index, index_path):
+    """Saves the HNSWlib index to disk."""
+    print(f"Saving HNSW index to {index_path} with {index.get_current_count()} active elements "
+          f"(max elements: {index.max_elements_})...")
+    index.save_index(index_path)
+    print("HNSW index saved.")
 
 # --- Main Processing Logic ---
 def main():
     init_db()
     processor, model = load_model_and_processor()
-    model_dim = model.config.projection_dim # Get embedding dimension from model config
+    model_dim = model.config.projection_dim
 
-    faiss_index = load_faiss_index(model_dim)
-    next_faiss_id = faiss_index.ntotal # Start assigning new FAISS IDs from here if not using DB IDs
-
-    # If using DB primary keys as FAISS IDs, you'd need a different strategy for next_faiss_id
-    # For simplicity here, we'll use sequential FAISS IDs and store them in DB.
-    # A more robust way if using IndexIDMap is to use the DB's primary key as the FAISS ID.
-    # Let's adjust to use DB's primary key for FAISS IDs for better removal.
-    # We'll need to fetch max(id) from DB to know where to start if index is empty.
+    # Estimate initial capacity for new index based on disk images, or use a default
+    # This is only used if the index is created from scratch.
+    # HNSWlib can resize, but pre-allocating can be more efficient.
+    # For simplicity, we use a fixed default `initial_max_elements` in `load_hnsw_index`.
+    # A more dynamic value could be `max(1000, len(get_images_on_disk()))`
+    hnsw_index = load_hnsw_index(model_dim, VECTOR_INDEX_PATH, initial_max_elements=10000)
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -176,7 +176,6 @@ def main():
     db_images_info = get_image_info_from_db()
     print(f"Found {len(db_images_info)} images in database.")
 
-    # --- Identify changes ---
     disk_paths = set(disk_images_info.keys())
     db_paths = set(db_images_info.keys())
 
@@ -184,9 +183,11 @@ def main():
     deleted_paths = list(db_paths - disk_paths)
     existing_paths = list(disk_paths.intersection(db_paths))
 
-    images_to_vectorize_paths = [] # Full paths for vectorization
-    images_to_vectorize_rel_paths = [] # Relative paths for DB
+    images_to_vectorize_paths = []
+    images_to_vectorize_rel_paths = []
     images_to_vectorize_metadata = [] # (rel_path, hash, last_modified)
+    
+    total_vectors_processed_this_run = 0
 
     print(f"Found {len(new_paths)} new images.")
     for rel_path in new_paths:
@@ -202,9 +203,7 @@ def main():
         disk_info = disk_images_info[rel_path]
         db_info = db_images_info[rel_path]
 
-        # Check if last_modified time changed
-        if abs(disk_info["last_modified"] - db_info["last_modified"]) > 1e-6 : # Compare floats carefully
-            # If modified time changed, verify with hash (more robust)
+        if abs(disk_info["last_modified"] - db_info["last_modified"]) > 1e-6:
             current_hash = get_file_hash(disk_info["full_path"])
             if current_hash != db_info["hash"]:
                 print(f"Image modified (hash mismatch): {rel_path}")
@@ -212,133 +211,50 @@ def main():
                 images_to_vectorize_rel_paths.append(rel_path)
                 images_to_vectorize_metadata.append((rel_path, current_hash, disk_info["last_modified"]))
                 modified_count += 1
-                # We'll need to remove its old vector from FAISS
-                if db_info["faiss_id"] is not None:
+                
+                if db_info["vector_index_id"] is not None:
                     try:
-                        faiss_index.remove_ids(np.array([db_info["faiss_id"]], dtype=np.int64))
-                        print(f"  Removed old FAISS ID {db_info['faiss_id']} for modified image.")
-                    except RuntimeError as e:
-                        print(f"  Warning: Could not remove FAISS ID {db_info['faiss_id']}: {e}. "
-                              "Consider rebuilding index if this persists.")
-                # Mark old DB entry for faiss_id update later
-                cursor.execute("UPDATE images SET faiss_id = NULL WHERE relative_path = ?", (rel_path,))
-
+                        # Mark the old vector as deleted in HNSWlib
+                        hnsw_index.mark_deleted(db_info["vector_index_id"])
+                        print(f"  Marked old HNSW ID {db_info['vector_index_id']} as deleted for modified image.")
+                    except Exception as e: # HNSWlib might raise if ID not found
+                        print(f"  Warning: Could not mark HNSW ID {db_info['vector_index_id']} as deleted: {e}.")
+                # Mark old DB entry for vector_index_id update later (it will get the same ID back)
+                cursor.execute("UPDATE images SET vector_index_id = NULL WHERE relative_path = ?", (rel_path,))
+    conn.commit() # Commit after potential NULLing of vector_index_id
     print(f"Found {modified_count} modified images to re-vectorize.")
 
-    # --- Process Deletions ---
     if deleted_paths:
         print(f"Processing {len(deleted_paths)} deleted images...")
-        faiss_ids_to_remove = []
+        deleted_ids_marked_count = 0
         for rel_path in deleted_paths:
-            if db_images_info[rel_path]["faiss_id"] is not None:
-                faiss_ids_to_remove.append(db_images_info[rel_path]["faiss_id"])
+            image_db_info = db_images_info.get(rel_path) # Get full info
+            if image_db_info and image_db_info["vector_index_id"] is not None:
+                try:
+                    hnsw_index.mark_deleted(image_db_info["vector_index_id"])
+                    deleted_ids_marked_count += 1
+                    print(f"  Marked HNSW ID {image_db_info['vector_index_id']} for {rel_path} as deleted.")
+                except Exception as e:
+                    print(f"  Warning: Could not mark HNSW ID {image_db_info['vector_index_id']} for {rel_path} as deleted: {e}.")
+            
             cursor.execute("DELETE FROM images WHERE relative_path = ?", (rel_path,))
             print(f"  Removed from DB: {rel_path}")
-
-        if faiss_ids_to_remove:
-            print(f"  Removing {len(faiss_ids_to_remove)} IDs from FAISS index...")
-            try:
-                faiss_index.remove_ids(np.array(faiss_ids_to_remove, dtype=np.int64))
-                print(f"  Successfully removed {len(faiss_ids_to_remove)} IDs from FAISS.")
-            except RuntimeError as e: # faiss.FaissException might also be relevant
-                print(f"  Error removing IDs from FAISS: {e}. "
-                      "The index might need rebuilding if IDs were not found. "
-                      "This can happen if FAISS IDs were not consistently managed.")
         conn.commit()
+        if deleted_ids_marked_count > 0:
+             print(f"  Marked {deleted_ids_marked_count} IDs as deleted in HNSW index.")
 
-    # --- Vectorize New and Modified Images ---
+
     if images_to_vectorize_paths:
         print(f"Vectorizing {len(images_to_vectorize_paths)} new/modified images in batches of {BATCH_SIZE}...")
-        new_vectors_list = []
-        new_faiss_ids_for_db = [] # Store (db_id, faiss_id_to_assign)
-
-        # Get the next available primary key ID from the DB for new entries
-        # This is a bit simplified; for concurrent access, this needs care.
-        # For modified images, we'll update existing rows.
+        
         cursor.execute("SELECT MAX(id) FROM images")
         max_db_id_row = cursor.fetchone()
         current_max_db_id = max_db_id_row[0] if max_db_id_row and max_db_id_row[0] is not None else 0
 
-        temp_faiss_id_counter = faiss_index.ntotal # A simple way to get unique IDs if not using DB IDs directly
-        # If we want to use DB's primary key as FAISS ID, we need to ensure they are unique
-        # and handle cases where FAISS index might have been built differently.
-        # For IndexIDMap, the IDs can be arbitrary 64-bit integers.
-
-        for i in range(0, len(images_to_vectorize_paths), BATCH_SIZE):
-            batch_paths = images_to_vectorize_paths[i : i + BATCH_SIZE]
-            batch_rel_paths = images_to_vectorize_rel_paths[i : i + BATCH_SIZE]
-            batch_metadata = images_to_vectorize_metadata[i : i + BATCH_SIZE]
-
-            print(f"  Processing batch {i // BATCH_SIZE + 1}...")
-            batch_vectors = vectorize_batch(batch_paths, processor, model)
-
-            valid_vectors_in_batch = []
-            valid_faiss_ids_for_batch = []
-            db_updates_for_batch = [] # (hash, last_mod, vectorized_at, faiss_id, rel_path) for UPDATE
-            db_inserts_for_batch = [] # (rel_path, hash, last_mod, vectorized_at, faiss_id) for INSERT
-
-            for j, vec in enumerate(batch_vectors):
-                if vec is not None:
-                    rel_path = batch_rel_paths[j]
-                    meta = batch_metadata[j] # (rel_path, hash, last_modified)
-
-                    # Determine if it's an update or insert based on whether it was 'modified' or 'new'
-                    is_update = rel_path in existing_paths # More accurately, if it was identified as modified
-
-                    # Assign a FAISS ID. Using DB primary key is robust.
-                    # For new images:
-                    if not is_update: # It's a new image
-                        current_max_db_id += 1
-                        assigned_faiss_id = current_max_db_id # Use DB ID as FAISS ID
-                        db_inserts_for_batch.append(
-                            (rel_path, meta[1], meta[2], time.time(), assigned_faiss_id)
-                        )
-                    else: # It's a modified image, find its DB ID
-                        cursor.execute("SELECT id FROM images WHERE relative_path = ?", (rel_path,))
-                        db_id_row = cursor.fetchone()
-                        if db_id_row:
-                            assigned_faiss_id = db_id_row[0]
-                            db_updates_for_batch.append(
-                                (meta[1], meta[2], time.time(), assigned_faiss_id, rel_path)
-                            )
-                        else: # Should not happen if logic is correct
-                            print(f"Error: Modified image {rel_path} not found in DB for ID retrieval.")
-                            continue
-
-                    valid_vectors_in_batch.append(vec)
-                    valid_faiss_ids_for_batch.append(assigned_faiss_id)
-
-            if valid_vectors_in_batch:
-                vectors_np = np.array(valid_vectors_in_batch).astype("float32")
-                faiss_ids_np = np.array(valid_faiss_ids_for_batch, dtype=np.int64)
-                faiss_index.add_with_ids(vectors_np, faiss_ids_np)
-                new_vectors_list.extend(valid_vectors_in_batch) # Not strictly needed if directly adding to FAISS
-
-                # Update/Insert into DB
-                if db_inserts_for_batch:
-                    cursor.executemany(
-                        """INSERT INTO images (relative_path, file_hash, last_modified, vectorized_at, faiss_id)
-                           VALUES (?, ?, ?, ?, ?)""",
-                        db_inserts_for_batch,
-                    )
-                if db_updates_for_batch:
-                    cursor.executemany(
-                        """UPDATE images SET file_hash = ?, last_modified = ?, vectorized_at = ?, faiss_id = ?
-                           WHERE relative_path = ?""",
-                        db_updates_for_batch,
-                    )
-                conn.commit()
-                print(f"    Added {len(valid_vectors_in_batch)} vectors to FAISS and DB for this batch.")
-
-        print(f"Finished vectorizing. Total new/modified vectors added: {faiss_index.ntotal - (next_faiss_id - len(deleted_paths))}") # Rough count
-
-    else:
-        print("No new or modified images to vectorize.")
-
-    # --- Save final FAISS index ---
-    save_faiss_index(faiss_index)
-    conn.close()
-    print("Processing complete.")
-
-if __name__ == "__main__":
-    main()
+        # Ensure HNSW index can accommodate new items. add_items handles resizing if needed.
+        # We could proactively resize here if adding a very large number of items at once:
+        # current_capacity = hnsw_index.max_elements_
+        # required_capacity = hnsw_index.get_current_count() + len(images_to_vectorize_paths) # A rough estimate
+        # if required_capacity > current_capacity:
+        #     print(f"Resizing HNSW index from {current_capacity} to {required_capacity * 1.2}") # Add some buffer
+        #     hnsw_index.resize_index(int(required_capacity 
