@@ -1,1 +1,7 @@
+numpy
+faiss-gpu # faiss-gpu if you have CUDA or faiss-cpu for CPU
+Pillow
+transformers
 torch
+sentencepiece
+accelerate
