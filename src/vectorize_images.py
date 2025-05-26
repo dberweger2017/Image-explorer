@@ -1,3 +1,4 @@
+# src/vectorize_images.py
 import os
 import sqlite3
 import hashlib
